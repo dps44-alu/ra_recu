@@ -8,21 +8,34 @@
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <unordered_map>
 
 using namespace std;
 
-// Network architecture
-const int INPUT_SIZE = 26;
-const int HIDDEN_SIZE = 32;  // Reduced for stability
+// Network architecture (must match the agent)
+const std::vector<int> RAM_POSITIONS = {
+    0x10, 0x30, 0x40, 0x21, 0x31, 0x22, 0x32, 0x42, 0x13, 0x44,
+    0x25, 0x45, 0x55, 0x16, 0x26, 0x46, 0x07, 0x47, 0x08, 0x09,
+    0x49, 0x4a, 0x4b, 0x0f, 0x1f, 0x2f
+};
+const int INPUT_SIZE  = RAM_POSITIONS.size();
+const int HIDDEN_SIZE = 30;    // Same as the game agent
 const int OUTPUT_SIZE = 3;
 
 // Training parameters
-const double LEARNING_RATE = 0.0001;  // Reduced learning rate
+const double LEARNING_RATE     = 0.0001;  // Initial learning rate
 const double MIN_LEARNING_RATE = 0.000001;
-const int MAX_EPOCHS = 2000;  // Increased max epochs
-const double MOMENTUM = 0.5;  // Reduced momentum
-const int BATCH_SIZE = 64;    // Increased batch size
-const double EPSILON = 1e-7;  // Small constant to prevent division by zero
+const int    MAX_EPOCHS        = 2000;
+const double MOMENTUM          = 0.5;
+const int    BATCH_SIZE        = 64;
+
+// Regularization and validation
+const double REGULARIZATION_L2 = 1e-5;     // L2 penalty strength
+const double VALIDATION_SPLIT  = 0.2;      // Percentage of data used for validation
+
+// Activation function selection
+enum class ActType { SIGMOID, TANH };
+const ActType ACTIVATION = ActType::SIGMOID;
 
 struct Network {
     vector<vector<vector<double>>> weights;
@@ -35,17 +48,6 @@ struct TrainingData {
     vector<double> inputs;
     vector<double> targets;
 };
-
-// Safe math operations
-double safe_exp(double x) {
-    if (x > 88.0) return exp(88.0);
-    if (x < -88.0) return exp(-88.0);
-    return exp(x);
-}
-
-double safe_log(double x) {
-    return log(max(x, EPSILON));
-}
 
 // Initialize network with careful weight initialization
 Network initializeNetwork() {
@@ -91,105 +93,83 @@ Network initializeNetwork() {
     return net;
 }
 
-// ReLU with gradient clipping
-double relu(double x) {
-    return min(max(x, 0.0), 5.0); // Clip activation
+// Generic activation depending on ACTIVATION
+double activate(double x) {
+    switch(ACTIVATION) {
+        case ActType::TANH:
+            return tanh(x);
+        case ActType::SIGMOID:
+        default:
+            return 1.0 / (1.0 + exp(-x));
+    }
 }
 
-double relu_derivative(double x) {
-    return (x > 0.0 && x < 5.0) ? 1.0 : 0.0;
+// Derivative computed from activation output
+double activationDerivative(double y) {
+    return (ACTIVATION == ActType::SIGMOID) ? y * (1.0 - y) : 1.0 - y * y;
 }
 
-// Forward pass with numerical stability checks
-vector<vector<double>> forward(const Network& net, const vector<double>& input, bool training = false) {
+// Forward pass returning activations of hidden and output layers
+vector<vector<double>> forward(const Network& net, const vector<double>& input) {
     vector<vector<double>> activations(2);
-    
-    // Hidden layer
+
     activations[0].resize(HIDDEN_SIZE);
     for(int i = 0; i < HIDDEN_SIZE; i++) {
         double sum = net.biases[0][i];
         for(int j = 0; j < INPUT_SIZE; j++) {
             sum += net.weights[0][i][j] * input[j];
         }
-        // Clip sum to prevent explosion
-        sum = max(min(sum, 100.0), -100.0);
-        activations[0][i] = relu(sum);
+        activations[0][i] = activate(sum);
     }
-    
-    // Output layer with stable softmax
+
     activations[1].resize(OUTPUT_SIZE);
-    double max_val = -numeric_limits<double>::infinity();
     for(int i = 0; i < OUTPUT_SIZE; i++) {
         double sum = net.biases[1][i];
         for(int j = 0; j < HIDDEN_SIZE; j++) {
             sum += net.weights[1][i][j] * activations[0][j];
         }
-        // Clip sum to prevent explosion
-        sum = max(min(sum, 100.0), -100.0);
-        activations[1][i] = sum;
-        max_val = max(max_val, sum);
+        activations[1][i] = activate(sum);
     }
-    
-    // Stable softmax implementation
-    double sum_exp = 0.0;
-    for(int i = 0; i < OUTPUT_SIZE; i++) {
-        activations[1][i] = safe_exp(activations[1][i] - max_val);
-        sum_exp += activations[1][i];
-    }
-    
-    sum_exp = max(sum_exp, EPSILON);
-    for(int i = 0; i < OUTPUT_SIZE; i++) {
-        activations[1][i] /= sum_exp;
-        // Ensure outputs are valid probabilities
-        activations[1][i] = max(min(activations[1][i], 1.0 - EPSILON), EPSILON);
-    }
-    
+
     return activations;
 }
 
-// Stable backpropagation
-void backpropagate(Network& net, const vector<double>& input, const vector<double>& target, 
+// Standard backpropagation using mean squared error
+void backpropagate(Network& net, const vector<double>& input, const vector<double>& target,
                   const vector<vector<double>>& activations, double learning_rate) {
-    // Output layer deltas with gradient clipping
     vector<double> output_deltas(OUTPUT_SIZE);
     for(int i = 0; i < OUTPUT_SIZE; i++) {
-        output_deltas[i] = activations[1][i] - target[i];
-        output_deltas[i] = max(min(output_deltas[i], 1.0), -1.0); // Clip gradients
+        double out = activations[1][i];
+        output_deltas[i] = (out - target[i]) * activationDerivative(out);
     }
-    
-    // Hidden layer deltas
+
     vector<double> hidden_deltas(HIDDEN_SIZE);
     for(int i = 0; i < HIDDEN_SIZE; i++) {
         double error = 0.0;
         for(int j = 0; j < OUTPUT_SIZE; j++) {
             error += output_deltas[j] * net.weights[1][j][i];
         }
-        hidden_deltas[i] = error * relu_derivative(activations[0][i]);
-        hidden_deltas[i] = max(min(hidden_deltas[i], 1.0), -1.0); // Clip gradients
+        double h = activations[0][i];
+        hidden_deltas[i] = error * activationDerivative(h);
     }
-    
-    // Update weights with careful learning rate and momentum
+
     for(int i = 0; i < OUTPUT_SIZE; i++) {
         for(int j = 0; j < HIDDEN_SIZE; j++) {
-            double delta = output_deltas[i] * activations[0][j];
-            delta = max(min(delta * learning_rate, 0.1), -0.1); // Clip update
-            net.momentum_weights[1][i][j] = MOMENTUM * net.momentum_weights[1][i][j] + delta;
+            double grad = output_deltas[i] * activations[0][j] + REGULARIZATION_L2 * net.weights[1][i][j];
+            net.momentum_weights[1][i][j] = MOMENTUM * net.momentum_weights[1][i][j] + learning_rate * grad;
             net.weights[1][i][j] -= net.momentum_weights[1][i][j];
         }
-        net.momentum_biases[1][i] = MOMENTUM * net.momentum_biases[1][i] + 
-                                   learning_rate * output_deltas[i];
+        net.momentum_biases[1][i] = MOMENTUM * net.momentum_biases[1][i] + learning_rate * output_deltas[i];
         net.biases[1][i] -= net.momentum_biases[1][i];
     }
-    
+
     for(int i = 0; i < HIDDEN_SIZE; i++) {
         for(int j = 0; j < INPUT_SIZE; j++) {
-            double delta = hidden_deltas[i] * input[j];
-            delta = max(min(delta * learning_rate, 0.1), -0.1); // Clip update
-            net.momentum_weights[0][i][j] = MOMENTUM * net.momentum_weights[0][i][j] + delta;
+            double grad = hidden_deltas[i] * input[j] + REGULARIZATION_L2 * net.weights[0][i][j];
+            net.momentum_weights[0][i][j] = MOMENTUM * net.momentum_weights[0][i][j] + learning_rate * grad;
             net.weights[0][i][j] -= net.momentum_weights[0][i][j];
         }
-        net.momentum_biases[0][i] = MOMENTUM * net.momentum_biases[0][i] + 
-                                   learning_rate * hidden_deltas[i];
+        net.momentum_biases[0][i] = MOMENTUM * net.momentum_biases[0][i] + learning_rate * hidden_deltas[i];
         net.biases[0][i] -= net.momentum_biases[0][i];
     }
 }
@@ -213,44 +193,41 @@ vector<TrainingData> loadTrainingData(const string& filename) {
             istringstream step_line(line);
             string step_word, colon;
             int action;
-            
-            // Parse "Step", action, and colon
+
             step_line >> step_word >> action >> colon;
-            
-            // Mapear las acciones 0,1,2,3 a 0,1,2 (combinando algunas)
-            int mapped_action = action;
-            if (action == 3) mapped_action = 2;  // Mapeamos 3 a 2
+
+            int mapped_action = (action == 3) ? 2 : action;
             if (mapped_action >= 0 && mapped_action <= 2) {
-                vector<double> targets(3, 0.0);
+                vector<double> targets(OUTPUT_SIZE, 0.0);
                 targets[mapped_action] = 1.0;
-                
-                // Initialize inputs with default values
-                vector<double> inputs(INPUT_SIZE, 0.0);
-                
-                // Parse RAM values
+
+                unordered_map<int, double> ram_values;
                 string ram_entry;
                 while (step_line >> ram_entry) {
                     if (ram_entry[0] == 'R') {
-                        size_t underscore_pos = ram_entry.find('_');
-                        if (underscore_pos != string::npos) {
+                        size_t u = ram_entry.find('_');
+                        if (u != string::npos) {
                             try {
-                                int ram_pos = stoi(ram_entry.substr(1, underscore_pos - 1));
-                                double ram_val = stod(ram_entry.substr(underscore_pos + 1));
-                                
-                                if (ram_pos >= 0 && ram_pos < INPUT_SIZE) {
-                                    // Normalize input to [-1, 1]
-                                    inputs[ram_pos] = (ram_val / 255.0) * 2.0 - 1.0;
-                                }
-                            } catch (const exception& e) {
-                                // Silently skip invalid entries
+                                int ram_pos = stoi(ram_entry.substr(1, u - 1));
+                                double ram_val = stod(ram_entry.substr(u + 1));
+                                ram_values[ram_pos] = ram_val;
+                            } catch (...) {
                                 continue;
                             }
                         }
                     }
                 }
-                
+
+                vector<double> inputs(INPUT_SIZE, 1.0);
+                for(size_t idx = 0; idx < RAM_POSITIONS.size(); ++idx) {
+                    int pos = RAM_POSITIONS[idx];
+                    if (ram_values.count(pos)) {
+                        inputs[idx] = ram_values[pos];
+                    }
+                }
+
                 data.push_back({inputs, targets});
-                action_mapping[action]++;
+                action_mapping[mapped_action]++;
             } else {
                 cerr << "Invalid action value: " << action << " at line " << line_count << endl;
             }
@@ -277,7 +254,7 @@ void printWeights(const Network& net) {
         cout << "{ " << fixed << setprecision(2) << net.biases[1][output];
         
         // Combine weights through hidden layer
-        for(int input = 0; input < INPUT_SIZE - 1; input++) {
+        for(int input = 0; input < INPUT_SIZE; input++) {
             double combined_weight = 0.0;
             for(int hidden = 0; hidden < HIDDEN_SIZE; hidden++) {
                 combined_weight += net.weights[0][hidden][input] * net.weights[1][output][hidden];
@@ -292,37 +269,38 @@ void printWeights(const Network& net) {
 }
 int main() {
     Network net = initializeNetwork();
-    vector<TrainingData> training_data = loadTrainingData("../agents/datos.csv");
-    cout << "Loaded " << training_data.size() << " training samples" << endl;
-    
-    if(training_data.empty()) {
+    vector<TrainingData> all_data = loadTrainingData("../agents/datos.csv");
+    cout << "Loaded " << all_data.size() << " training samples" << endl;
+
+    if(all_data.empty()) {
         cerr << "No training data found!" << endl;
         return 1;
     }
     
     // Print initial distribution of actions
     vector<int> initial_actions(3, 0);
-    for(const auto& sample : training_data) {
+    for(const auto& sample : all_data) {
         int action = max_element(sample.targets.begin(), sample.targets.end()) - sample.targets.begin();
         initial_actions[action]++;
     }
     cout << "Initial action distribution: [";
     for(int i = 0; i < 3; i++) {
-        cout << (initial_actions[i] * 100.0 / training_data.size()) << "% ";
+        cout << (initial_actions[i] * 100.0 / all_data.size()) << "% ";
     }
     cout << "]" << endl;
-    
-    // Normalize inputs to [-1, 1] range
-    for(auto& sample : training_data) {
-        for(double& input : sample.inputs) {
-            input = max(min(input, 1.0), -1.0);
-        }
-    }
-    
+
     random_device rd;
     mt19937 gen(rd());
+
+    // Split into training and validation sets
+    shuffle(all_data.begin(), all_data.end(), gen);
+    size_t val_count = static_cast<size_t>(all_data.size() * VALIDATION_SPLIT);
+    vector<TrainingData> validation_data(all_data.begin(), all_data.begin() + val_count);
+    vector<TrainingData> training_data(all_data.begin() + val_count, all_data.end());
+    cout << "Training samples: " << training_data.size()
+         << " - Validation samples: " << validation_data.size() << endl;
     
-    double best_accuracy = 0.0;
+    double best_val_accuracy = 0.0;
     int epochs_without_improvement = 0;
     double learning_rate = LEARNING_RATE;
     
@@ -336,7 +314,7 @@ int main() {
             size_t batch_end = min(i + BATCH_SIZE, training_data.size());
             
             for(size_t j = i; j < batch_end; j++) {
-                vector<vector<double>> activations = forward(net, training_data[j].inputs, true);
+                vector<vector<double>> activations = forward(net, training_data[j].inputs);
                 
                 double sample_error = 0.0;
                 for(int k = 0; k < OUTPUT_SIZE; k++) {
@@ -359,29 +337,33 @@ int main() {
         
         double accuracy = static_cast<double>(correct_predictions) / training_data.size();
         double avg_error = total_error / training_data.size();
-        
+
+        // Validation metrics
+        double val_error = 0.0;
+        int val_correct = 0;
+        for(const auto& sample : validation_data) {
+            vector<vector<double>> pred = forward(net, sample.inputs);
+            for(int k = 0; k < OUTPUT_SIZE; k++) {
+                val_error += pow(sample.targets[k] - pred[1][k], 2);
+            }
+            int p = max_element(pred[1].begin(), pred[1].end()) - pred[1].begin();
+            int a = max_element(sample.targets.begin(), sample.targets.end()) - sample.targets.begin();
+            if(p == a) val_correct++;
+        }
+        double val_accuracy = static_cast<double>(val_correct) / validation_data.size();
+        double val_avg_error = val_error / validation_data.size();
+
         if(epoch % 10 == 0) {
-            cout << "Epoch " << epoch << 
-                    " - Error: " << avg_error << 
-                    " - Accuracy: " << (accuracy * 100) << "%" <<
-                    " - Learning Rate: " << learning_rate;
-            
-            // Print distribution of predictions
-            vector<int> action_counts(3, 0);
-            for(const auto& sample : training_data) {
-                vector<vector<double>> pred = forward(net, sample.inputs);
-                int predicted = max_element(pred[1].begin(), pred[1].end()) - pred[1].begin();
-                action_counts[predicted]++;
-            }
-            cout << " - Action distribution: [";
-            for(int i = 0; i < 3; i++) {
-                cout << (action_counts[i] * 100.0 / training_data.size()) << "% ";
-            }
-            cout << "]" << endl;
+            cout << "Epoch " << epoch
+                 << " - TrainErr: " << avg_error
+                 << " - TrainAcc: " << (accuracy * 100) << "%"
+                 << " - ValErr: " << val_avg_error
+                 << " - ValAcc: " << (val_accuracy * 100) << "%"
+                 << " - LR: " << learning_rate << endl;
         }
         
-        if(accuracy > best_accuracy) {
-            best_accuracy = accuracy;
+        if(val_accuracy > best_val_accuracy) {
+            best_val_accuracy = val_accuracy;
             epochs_without_improvement = 0;
         } else {
             epochs_without_improvement++;
@@ -391,7 +373,7 @@ int main() {
             }
             if(epochs_without_improvement >= 30) {
                 cout << "\nEarly stopping triggered after " << epoch << " epochs" << endl;
-                cout << "Best accuracy achieved: " << (best_accuracy * 100) << "%" << endl;
+                cout << "Best validation accuracy: " << (best_val_accuracy * 100) << "%" << endl;
                 break;
             }
         }
